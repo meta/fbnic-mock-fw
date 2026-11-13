@@ -91,7 +91,7 @@ def write_desc(mbx: MockMbx, slot_idx: int, val: int) -> None:
     return
 
 
-def read_desc_64(base_addr: int) -> int:
+def read_desc_64(base_addr: bytes) -> int:
     mbx = get_mbx(base_addr)
     lower_slot = mbx.get_slot(base_addr)
 
@@ -108,7 +108,7 @@ def read_desc_64(base_addr: int) -> int:
     return desc
 
 
-def read_desc_32(base_addr: int) -> int:
+def read_desc_32(base_addr: bytes) -> int:
     mbx = get_mbx(base_addr)
     slot_idx = mbx.get_slot(base_addr)
     desc = mbx.slots[slot_idx]
@@ -120,6 +120,7 @@ def read_desc_32(base_addr: int) -> int:
 class HostIpcMbxDesc(IntFlag):
     HOST_CMPL = bit(0)
     FW_CMPL = bit(1)
+    FW_ERR = bit(2)
     EOM = bit(46)
 
 

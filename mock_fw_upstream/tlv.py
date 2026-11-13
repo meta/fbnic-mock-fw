@@ -16,6 +16,7 @@ from scapy.all import Packet, Raw
 logger = logging.getLogger(__name__)
 
 TLV_HEADER_SIZE = 4  # bytes
+TLV_WIRE_MAX: int = 0xFFFF
 TLV_ATTR_ARRAY_SIZE = 32
 TLV_MAX_DATA = PAGE_SIZE - 512
 ETH_ALEN = 6  # MAC address length
@@ -43,11 +44,16 @@ class TlvAttr:
 
 
 class TlvMessageBuilder:
-    def __init__(self, msg_id: int, offset_in_page: int = 0):
+    def __init__(
+        self, msg_id: int, offset_in_page: int = 0, *, buffer_size: int = PAGE_SIZE
+    ):
+        if not 0 <= offset_in_page <= buffer_size - TLV_HEADER_SIZE:
+            raise ValueError("TLV message header does not fit in buffer")
         self._msg_hdr_id = msg_id
         self._len = 1  # initial message header, len in dwords
         self._attrs: list[TlvAttr] = []
         self._offset_in_page = offset_in_page
+        self._buffer_size = buffer_size
 
     def add_u32(self, attr_id: int, value: int) -> "TlvMessageBuilder":
         value_in_bytes = int_to_bytes(value, length=4)
@@ -71,23 +77,9 @@ class TlvMessageBuilder:
         return self
 
     def add_string(self, attr_id: int, value: str) -> "TlvMessageBuilder":
-        value_in_bytes = value.encode("latin-1")
-
-        attr_max_len = (
-            calculate_remaining_space(self._offset_in_page) - 4
-        )  # for message header
-        str_len = 1  # account for null terminator first
-
-        attr_max_len -= self._len * 4  # minus bytes instead of dwords
-
-        # Calculate actual string length, capped at available space (Python equivalent of strnlen)
-        # If value_in_bytes is greater than available space, str_len += attr_max_len and error will
-        # be logged in tlv_attr_add_value when we check bounds
-        str_len += min(len(value_in_bytes), attr_max_len)
-
-        value_in_bytes += b"\x00"  # need to add null terminator for Python
+        value_in_bytes = value.encode("latin-1") + b"\x00"
         self._attrs.append(
-            TlvAttr(id=attr_id, value_bytes=value_in_bytes, length=str_len)
+            TlvAttr(id=attr_id, value_bytes=value_in_bytes, length=len(value_in_bytes))
         )
         return self
 
@@ -104,30 +96,23 @@ class TlvMessageBuilder:
         self._attrs.append(TlvAttr(id=attr_id, value_bytes=b"", length=0))
         return self
 
-    def process_tlv_attr(self, tlv_attr: TlvAttr) -> Packet | None:
+    def process_tlv_attr(self, tlv_attr: TlvAttr) -> Packet:
         attr_id = tlv_attr.id
         value = tlv_attr.value_bytes
         length = tlv_attr.length
         HEADER_SIZE = 4  # bytes
 
-        attr_max_len = (
-            calculate_remaining_space(self._offset_in_page)
-            - HEADER_SIZE  # message header
-        )
-
-        attr_max_len -= self._len * 4  # minus bytes instead of dwords
-
-        if attr_max_len < length + HEADER_SIZE:  # attribute header
-            logger.error(
-                f"Attribute {attr_id} is too large to fit in the remaining space. "
-                f"Available length is {attr_max_len} bytes, but value has length {length} bytes"
-            )
-            return None
+        if length != len(value) or not 0 <= length <= TLV_WIRE_MAX - HEADER_SIZE:
+            raise ValueError(f"Attribute {attr_id} has invalid payload length {length}")
+        new_len = self._len + tlv_msg_size(HEADER_SIZE + length)
+        if (
+            new_len > TLV_WIRE_MAX
+            or new_len * HEADER_SIZE > self._buffer_size - self._offset_in_page
+        ):
+            raise ValueError(f"Attribute {attr_id} does not fit in TLV buffer")
 
         attr_hdr = make_tlv_attr_hdr(attr_id, payload_size=length)
-
-        # Adjust msg length since we added attribute header and payload
-        self._len += tlv_msg_size(attr_hdr.length)
+        self._len = new_len
 
         # Likely a flag, there won't be a payload
         if length == 0 and value == b"":
@@ -143,6 +128,7 @@ class TlvMessageBuilder:
         return attr_hdr / payload
 
     def build(self) -> bytes:
+        self._len = 1
         msg_hdr = make_tlv_msg_hdr(self._msg_hdr_id)
 
         pkts = []

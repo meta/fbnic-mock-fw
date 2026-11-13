@@ -47,6 +47,8 @@ from mock_fw_upstream.tlv import (
     tlv_attr_s32,
     tlv_attr_u32,
     TLV_HEADER_SIZE,
+    tlv_msg_align,
+    TLV_WIRE_MAX,
     TlvMessageBuilder,
 )
 from mock_fw_upstream.utils import bytes_to_int, int_to_bytes
@@ -343,15 +345,22 @@ class ReadCoredumpRequestHandler(TlvMessageHandler):
             self._attr_list[CoredumpReadTlvAttrId.COREDUMP_READ_LENGTH]
         )
 
+        capacity = extract_length(_read_host_rx_descriptor())
         msg = (
-            TlvMessageBuilder(TlvMsgId.READ_COREDUMP_RESP)
+            TlvMessageBuilder(
+                TlvMsgId.READ_COREDUMP_RESP, buffer_size=max(TLV_HEADER_SIZE, capacity)
+            )
             .add_u32(CoredumpReadTlvAttrId.COREDUMP_READ_OFFSET, offset)
             .add_u32(CoredumpReadTlvAttrId.COREDUMP_READ_LENGTH, length)
         )
 
         buffer = bytearray(0)
-
-        err = fw_state.coredump_manager.read_coredump(buffer, offset, length)
+        # Message header, two u32 attributes, and the data attribute header.
+        response_size = 24 + tlv_msg_align(length)
+        if length > TLV_WIRE_MAX - TLV_HEADER_SIZE or response_size > capacity:
+            err = errno.EOVERFLOW
+        else:
+            err = fw_state.coredump_manager.read_coredump(buffer, offset, length)
 
         if err:
             msg.add_u32(CoredumpReadTlvAttrId.COREDUMP_READ_ERROR, err)
@@ -803,12 +812,26 @@ def process_descriptor_write(addr: bytes, val: int) -> None:
         dma_addr = extract_address(desc)
         length = extract_length(desc)
         logger.info(f"DMA into address {bytes_to_int(dma_addr):#x}")
-        data = dma_read(dma_addr, length)
-        msg_hdr_bytes, attr_bytes = data[:TLV_HEADER_SIZE], data[TLV_HEADER_SIZE:]
-        parsed_tlv_msg_hdr = parse_tlv_hdr_data(msg_hdr_bytes)
-        process_tlv_tx_msg(parsed_tlv_msg_hdr, attr_bytes)
+        failed = False
+        try:
+            if length < TLV_HEADER_SIZE or length % TLV_HEADER_SIZE:
+                raise ValueError("Invalid TX descriptor length")
+            data = dma_read(dma_addr, length)
+            msg_hdr_bytes, attr_bytes = data[:TLV_HEADER_SIZE], data[TLV_HEADER_SIZE:]
+            parsed_tlv_msg_hdr = parse_tlv_hdr_data(msg_hdr_bytes)
+            if (
+                not parsed_tlv_msg_hdr.is_msg
+                or parsed_tlv_msg_hdr.length * TLV_HEADER_SIZE != length
+            ):
+                raise ValueError("Invalid TX message framing")
+            process_tlv_tx_msg(parsed_tlv_msg_hdr, attr_bytes)
+        except (RuntimeError, ValueError) as error:
+            logger.error(f"Failed TX descriptor: {error}")
+            failed = True
 
         completed_desc = desc | HostIpcMbxDesc.FW_CMPL
+        if failed:
+            completed_desc |= HostIpcMbxDesc.FW_ERR
         logger.debug(f"Completed descriptor is {completed_desc:#x}")
 
         lower_32_bits = completed_desc & 0xFFFFFFFF
@@ -930,34 +953,49 @@ def gen_dummy_cmpl_msg(parsed_bar: ParsedBar) -> bytes:
     return msg
 
 
+def _read_host_rx_descriptor() -> int:
+    addr = MBX_0_REG_0_ADDR + mock_mbx_0.head * SLOT_WIDTH
+    return read_desc_64(int_to_bytes(addr, length=6))
+
+
 def send_to_host(tlv_builder: TlvMessageBuilder) -> None:
-    send_bytes_to_host(tlv_builder.build())
+    try:
+        msg = tlv_builder.build()
+    except ValueError as error:
+        logger.error(f"Cannot build host response: {error}")
+        msg = b""
+    send_bytes_to_host(msg)
 
 
 def send_bytes_to_host(tlv_msg: bytes) -> None:
-    # 1. Find ready slot in mailbox rx
-    ADDR_WIDTH = 6  # bytes
+    """Complete the posted RX buffer, with FW_ERR and no DMA on an unsafe response."""
     avail_slot_idx = mock_mbx_0.head
-    avail_slot_idx_addr = MBX_0_REG_0_ADDR + avail_slot_idx * SLOT_WIDTH
-
-    # 2. Read to get address of page that host allocated for us
-    desc = read_desc_64(int_to_bytes(avail_slot_idx_addr, length=ADDR_WIDTH))
+    desc = _read_host_rx_descriptor()
 
     if not is_slot_ready(desc):
         logger.error(f"Mailbox 0 slot {avail_slot_idx} is not ready")
         return
 
-    dma_addr = extract_address(desc)
-
-    # 2. Write to page
     bytes_to_write = len(tlv_msg)
-    dma_write(dma_addr, tlv_msg, bytes_to_write)
+    failed = False
+    try:
+        if not TLV_HEADER_SIZE <= bytes_to_write <= extract_length(desc):
+            raise ValueError("Response exceeds posted descriptor capacity")
+        msg_hdr = ParsedTlvHdr(tlv_msg[:TLV_HEADER_SIZE])
+        if not msg_hdr.is_msg or msg_hdr.length * TLV_HEADER_SIZE != bytes_to_write:
+            raise ValueError("Invalid response framing")
+        dma_write(extract_address(desc), tlv_msg, bytes_to_write)
+    except (RuntimeError, ValueError) as error:
+        logger.error(f"Failed host response: {error}")
+        bytes_to_write = 0
+        failed = True
 
-    # 3. Update descriptors FW_CMPL, EOM and length
-    updated_desc = desc & ~LEN_MASK
+    updated_desc = desc & ~(LEN_MASK | HostIpcMbxDesc.FW_ERR | HostIpcMbxDesc.EOM)
     updated_desc |= (
         HostIpcMbxDesc.FW_CMPL | HostIpcMbxDesc.EOM | (bytes_to_write << LEN_SHIFT)
     )
+    if failed:
+        updated_desc |= HostIpcMbxDesc.FW_ERR
 
     logger.debug(f"Updated descriptor is {updated_desc:#x}")
 
